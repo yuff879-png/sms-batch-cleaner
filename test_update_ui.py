@@ -68,6 +68,45 @@ class UpdateUiTests(unittest.TestCase):
     def drain(self):
         self.ui._drain_events()
 
+    def test_cancel_delete_confirmation_preserves_snapshot_without_deleting(self):
+        with patch.object(app.messagebox, "askokcancel", return_value=False) as confirmation, patch("tkinter.simpledialog.askstring", side_effect=AssertionError("删除确认不应要求输入文字")):
+            self.ui.delete_sms()
+        self.ui.cleaner.delete.assert_not_called()
+        self.ui.cleaner.discard_plan.assert_not_called()
+        self.assertIs(self.ui.plan_result, self.snapshot)
+        self.assertFalse(self.ui.busy)
+        self.assertEqual(str(self.ui.delete_button["state"]), "normal")
+        confirmation.assert_called_once()
+        prompt = confirmation.call_args.args[1]
+        self.assertIn(self.snapshot.model, prompt)
+        self.assertIn(self.snapshot.serial[-4:], prompt)
+        self.assertIn(f"{self.snapshot.count:,} 条短信", prompt)
+        self.assertNotIn(self.snapshot.serial, prompt)
+        self.assertNotIn("输入", prompt)
+        self.assertIs(confirmation.call_args.kwargs["parent"], self.root)
+        self.assertEqual(confirmation.call_args.kwargs["icon"], "warning")
+        self.assertEqual(confirmation.call_args.kwargs["default"], "cancel")
+
+    def test_accept_delete_confirmation_deletes_selected_snapshot_once(self):
+        self.ui.cleaner.delete.return_value = {
+            "deleted": 2, "missing": 0, "changed": 0, "failed": 0,
+            "remaining_target": 0, "remaining_total": 0, "verified": True,
+            "cancelled": False,
+        }
+        with patch.object(app.messagebox, "askokcancel", return_value=True) as confirmation, patch("tkinter.simpledialog.askstring", side_effect=AssertionError("删除确认不应要求输入文字")), patch.object(app.messagebox, "showinfo"):
+            self.ui.delete_sms()
+            self.assertTrue(self.ui.busy)
+            self.assertIsNone(self.ui.plan_result)
+            self.ui.delete_sms()
+            self.drain()
+            self.ui.delete_sms()
+        confirmation.assert_called_once()
+        self.ui.cleaner.delete.assert_called_once_with(self.snapshot)
+        self.ui.cleaner.discard_plan.assert_called_once_with(self.snapshot)
+        self.assertFalse(self.ui.busy)
+        self.assertIsNone(self.ui.plan_result)
+        self.assertEqual(str(self.ui.delete_button["state"]), "disabled")
+
     def test_phone_operation_blocks_check_download_and_update_controls(self):
         self.ui.operation = "清空短信"
         self.ui.operation_domain = "phone"

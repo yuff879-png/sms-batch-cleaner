@@ -15,7 +15,7 @@ import queue
 import sys
 import threading
 import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import messagebox, ttk
 import uuid
 
 from version import VERSION
@@ -455,10 +455,13 @@ class CleanerApp:
             f"准备删除：{snapshot.count:,} 条短信\n\n"
             "确认后将直接删除本次检测到的短信。\n"
             "仅处理本次检测的短信编号，之后新增的短信留待下次检测。\n\n"
-            "输入「清空」后继续："
+            "是否确定清空？"
         )
-        confirmation = simpledialog.askstring("确认清空当前手机", prompt, parent=self.root)
-        if confirmation != "清空":
+        confirmation = messagebox.askokcancel(
+            "确认清空当前手机", prompt, parent=self.root,
+            icon=messagebox.WARNING, default=messagebox.CANCEL,
+        )
+        if not confirmation:
             self.log("[取消] 未确认清空，手机短信未修改。")
             return
         # A deletion plan is single-use in the interface, even on partial failure.
