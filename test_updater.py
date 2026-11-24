@@ -52,7 +52,7 @@ class OwnedFakeProcess:
 class UpdateTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.install = self.root / "installed"
         self.install.mkdir()
         self.resources = self.root / "resources"
