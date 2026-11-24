@@ -1,0 +1,22 @@
+name: Windows tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - run: python -m pip install -r requirements-build.txt
+      - run: python -m unittest discover -v
+      - run: python -m py_compile app.py core.py updater.py update_worker.py build_release.py publish_release.py
