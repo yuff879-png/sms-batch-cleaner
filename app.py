@@ -438,9 +438,11 @@ class CleanerApp:
         android = snapshot.android or "未知"
         count = snapshot.count
         self.device_info.set(f"{model} · Android {android} · 短信 {count:,} 条\n{format_types(snapshot.types)}")
-        self.plan_info.set(f"本次检测到 {count:,} 条短信。核对当前手机后，点击「清空短信」。" if count else "当前手机没有短信，无需清空。")
-        self.status.set("检测通过，可以清空短信" if count else "当前手机没有短信")
-        self.log(f"[检测完成] {model}，Android {android}，短信 {count:,} 条。")
+        self.plan_info.set(f"本次检测到 {count:,} 条短信。核对当前手机后，点击「清空短信」。" if count else "未检测到可清理的本机 SMS。若手机仍显示消息，请重新打开短信应用，并查看日志中的排查提示。")
+        self.status.set("检测通过，可以清空短信" if count else "未检测到可清理的本机 SMS")
+        self.log(f"[检测完成] {model}，尾号 {snapshot.serial[-4:]}，Android {android}，本机 SMS {count:,} 条。")
+        if not count:
+            self.log("[排查提示] 0 条仅指当前用户短信接口返回的本机 SMS，不代表短信应用内所有会话均为空。请重新打开短信应用；若消息仍在，确认消息类型，并复制同一设备的检测及清理结果日志。MMS、RCS、SIM 卡和云端记录不在清理范围内。")
         self._update_controls()
 
     def delete_sms(self):
@@ -496,8 +498,10 @@ class CleanerApp:
             f"内容发生变化而跳过：{changed:,} 条\n"
             f"删除失败：{failed:,} 条\n"
             f"本次目标剩余：{remaining if remaining is not None else '未确认'}\n"
-            f"当前手机短信总数：{total if total is not None else '未确认'}"
+            f"当前本机 SMS 总数：{total if total is not None else '未确认'}"
         )
+        if verified and total == 0:
+            summary += "\n\n本机 SMS 已复查为 0 条。若短信应用仍显示会话，请重新打开应用；彩信、RCS、SIM 卡及云端记录不在清理范围内。"
         if verified and total:
             summary += "\n\n手机仍有其他或新到短信，需要重新检测后再清理。"
         if not verified:

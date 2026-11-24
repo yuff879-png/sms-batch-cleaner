@@ -81,6 +81,40 @@ class Cleaner:
         self._cancel.set()
 
     @staticmethod
+    def _sms_modes(result):
+        return ", ".join(f"{key}={result[key] if type(result.get(key)) is int else 'unknown'}"
+                         for key in ("read_sms_mode", "write_sms_mode"))
+
+    @staticmethod
+    def _device_diagnostic(result, serial):
+        model = result.get("model")
+        model = model if isinstance(model, str) else "未知"
+        if serial:
+            model = model.replace(serial, "[设备]")
+        model = re.sub(r"[^A-Za-z0-9\u3400-\u9fff ._()\-]", "_", model)[:64]
+        model = re.sub(r"\d{7,}", "[数字已隐藏]", model) or "未知"
+        suffix = re.sub(r"[^A-Za-z0-9]", "_", serial[-4:]) if len(serial) > 4 else "隐藏"
+        return f"model={model} serial_suffix=…{suffix}"
+
+    def _validate_sms_summary(self, result, serial):
+        if not isinstance(result, dict):
+            raise CleanerError("手机未返回有效的短信检测结果，当前短信数量未知；已阻止清空。")
+        modes = self._sms_modes(result)
+        self.log("短信能力：" + self._device_diagnostic(result, serial) + " " + modes)
+        if type(result.get("uid")) is not int or result["uid"] != 1001:
+            raise CleanerError("短信接口身份不正确，当前短信数量未知；已阻止后续操作。")
+        if type(result.get("read_sms_mode")) is not int or result["read_sms_mode"] != 0:
+            raise CleanerError("短信读取受限或权限未确认，当前短信数量未知。请检查系统短信读取权限及 root/ROM 限制，"
+                               f"重新检测后再清理。（{modes}）")
+        if type(result.get("write_sms_mode")) is not int or result["write_sms_mode"] != 0:
+            raise CleanerError("系统未确认短信清理权限，已阻止清空。请检查系统短信权限及 root/ROM 限制。"
+                               f"（{modes}）")
+        count = result.get("count")
+        if type(count) is not int or count < 0:
+            raise CleanerError("手机返回的短信数量无效，当前短信数量未知；请重新检测，已阻止清空。")
+        return count
+
+    @staticmethod
     def _command_failure(message: str, exit_code: int, stage: str):
         """Classify known diagnostics without returning their private contents."""
         lines = [line.strip().lower() for line in message.splitlines()]
@@ -288,6 +322,12 @@ class Cleaner:
                     continue
                 kind = event.get("event")
                 if kind == "error":
+                    self.log("短信接口权限诊断：" + self._sms_modes(event))
+                    if event.get("code") == "read_not_allowed":
+                        self._probed.discard(serial)
+                        raise CleanerError("短信读取受限，当前短信数量未知。请检查系统短信读取权限及 root/ROM 限制，"
+                                           "重新检测后再清理。"
+                                           f"（code=read_not_allowed，{self._sms_modes(event)}）")
                     code = str(event.get("code", "BRIDGE_ERROR"))
                     code = re.sub(r"[^A-Za-z0-9_.$-]", "", code)[:80]
                     exception = re.sub(r"[^A-Za-z0-9_.$-]", "", str(event.get("exception_class", event.get("exception", ""))))[:100]
@@ -350,14 +390,12 @@ class Cleaner:
 
     def probe(self, serial):
         self._cancel.clear()
+        self._probed.discard(serial)
         self.log("开始只读检测：检查 USB、主用户、root 和短信服务访问能力。")
         result = self._run_bridge(serial, "probe")
-        if result.get("uid") != 1001:
-            raise CleanerError("短信接口身份不正确，已阻止后续操作。")
-        if result.get("write_sms_mode") != 0:
-            raise CleanerError(f"只读检测发现 {result.get('count', '?')} 条短信，但系统未允许清理权限（WRITE_SMS mode={result.get('write_sms_mode', '?')}）。")
+        count = self._validate_sms_summary(result, serial)
         self._probed.add(serial)
-        self.log(f"检测成功：Android {result.get('android', '?')}，本机 SMS 共 {result.get('count', '?')} 条。")
+        self.log(f"检测成功：本机 SMS 共 {count} 条。")
         return result
 
     def prepare(self, serial):
@@ -389,7 +427,7 @@ class Cleaner:
                         self.progress({"event": "progress", "phase": "scanning", "processed": len(ids)})
 
                 summary = self._run_bridge(serial, "scan", consume)
-                if summary.get("count") != len(ids):
+                if self._validate_sms_summary(summary, serial) != len(ids):
                     raise CleanerError("短信统计与计划数量不一致，已阻止清空。")
                 stream.write(json.dumps(summary) + "\n")
                 stream.flush()
@@ -398,6 +436,7 @@ class Cleaner:
             return Snapshot(path, len(ids), summary.get("types", {}), serial,
                             file_hash(path), info.get("model", "Android"), str(info.get("android", "?")))
         except Exception:
+            self._probed.discard(serial)
             path.unlink(missing_ok=True)
             raise
 

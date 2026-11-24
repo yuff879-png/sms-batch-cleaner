@@ -62,12 +62,13 @@ public final class SmsBridge {
     private static FileLock operationLock;
     private ContentResolver resolver;
     private Context context;
-    private int writeMode;
-    private int readMode;
+    private AppOpsManager appOps;
+    private Integer writeMode;
+    private Integer readMode;
 
     public static void main(String[] args) {
+        SmsBridge bridge = new SmsBridge();
         try {
-            SmsBridge bridge = new SmsBridge();
             bridge.initialize();
             if (args.length == 1 && "probe".equals(args[0])) {
                 bridge.probe();
@@ -103,10 +104,14 @@ public final class SmsBridge {
                     if (stack.length() >= 12) break;
                     stack.put(frame.getClassName() + "." + frame.getMethodName() + ":" + frame.getLineNumber());
                 }
-                emit(new JSONObject().put("event", "error").put("code", code).put("message", message)
+                JSONObject error = new JSONObject().put("event", "error").put("code", code).put("message", message)
                     .put("stage", stage).put("exception_class", cause.getClass().getName())
                     .put("context_package", contextPackage).put("op_package", opPackage)
-                    .put("classification", classification).put("stack", stack));
+                    .put("classification", classification).put("stack", stack);
+                // Omit modes not yet observed; default 0 would falsely mean allowed.
+                if (bridge.readMode != null) error.put("read_sms_mode", bridge.readMode.intValue());
+                if (bridge.writeMode != null) error.put("write_sms_mode", bridge.writeMode.intValue());
+                emit(error);
             } catch (Throwable ignored) { }
             System.exit(1);
         }
@@ -184,9 +189,12 @@ public final class SmsBridge {
         ContentProviderClient client = clientConstructor.newInstance(baseResolver, provider, "sms", true);
         resolver = ContentResolver.wrap(client);
         stage = "appops";
-        AppOpsManager appOps = (AppOpsManager) context.getSystemService(Context.APP_OPS_SERVICE);
-        writeMode = appOps.checkOpNoThrow("android:write_sms", Process.myUid(), PACKAGE);
-        readMode = appOps.checkOpNoThrow("android:read_sms", Process.myUid(), PACKAGE);
+        appOps = (AppOpsManager) context.getSystemService(Context.APP_OPS_SERVICE);
+        if (appOps == null) {
+            throw new BridgeException("appops_unavailable", "Android SMS access state is unavailable.");
+        }
+        writeMode = appOps.unsafeCheckOpRawNoThrow("android:write_sms", Process.myUid(), PACKAGE);
+        requireReadAccess();
     }
 
     private static void acquireOperationLock() throws Exception {
@@ -231,12 +239,50 @@ public final class SmsBridge {
     }
 
     private Cursor query(Uri uri, String[] projection) throws Exception {
-        stage = "query";
-        Cursor cursor = resolver.query(uri, projection, null, null, "_id ASC");
-        if (cursor == null) {
-            throw new BridgeException("null_cursor", "SMS provider returned no query result.");
+        return queryWithAccessCheck(uri, projection, null, null, "_id ASC");
+    }
+
+    private void requireReadAccess() throws Exception {
+        stage = "read_sms_access";
+        readMode = null;
+        // The non-raw check maps MODE_FOREGROUND to MODE_ALLOWED. This helper
+        // has no foreground app lifecycle, so only raw MODE_ALLOWED is valid.
+        readMode = appOps.unsafeCheckOpRawNoThrow("android:read_sms", Process.myUid(), PACKAGE);
+        if (readMode.intValue() != AppOpsManager.MODE_ALLOWED) {
+            throw new BridgeException("read_not_allowed", "Android SMS read access is not allowed; message count is unknown.");
         }
-        return cursor;
+    }
+
+    private void requireDeleteAccess() throws Exception {
+        requireReadAccess();
+        stage = "write_sms_access";
+        writeMode = null;
+        writeMode = appOps.unsafeCheckOpRawNoThrow("android:write_sms", Process.myUid(), PACKAGE);
+        if (writeMode.intValue() != AppOpsManager.MODE_ALLOWED) {
+            throw new BridgeException("write_not_allowed", "Android SMS write access is not allowed for this helper.");
+        }
+    }
+
+    private Cursor queryWithAccessCheck(Uri uri, String[] projection, String selection,
+            String[] selectionArgs, String sortOrder) throws Exception {
+        // A denied READ_SMS AppOp can produce an empty cursor rather than an
+        // exception. Check on both sides so it cannot be treated as a zero count
+        // or a missing planned record. Every destructive per-ID query uses this.
+        // These checks reject observed revocation; they are not atomic with a
+        // provider operation or a rapid revoke-and-restore between checks.
+        requireReadAccess();
+        stage = "query";
+        Cursor cursor = resolver.query(uri, projection, selection, selectionArgs, sortOrder);
+        try {
+            requireReadAccess();
+            if (cursor == null) {
+                throw new BridgeException("null_cursor", "SMS provider returned no query result.");
+            }
+            return cursor;
+        } catch (Exception failure) {
+            if (cursor != null) cursor.close();
+            throw failure;
+        }
     }
 
     private void probe() throws Exception {
@@ -253,6 +299,7 @@ public final class SmsBridge {
                 }
             }
         }
+        requireReadAccess();
         emit(metadata().put("count", count).put("types", types));
     }
 
@@ -269,6 +316,7 @@ public final class SmsBridge {
                 count++;
             }
         }
+        requireReadAccess();
         emit(metadata().put("count", count).put("types", types));
     }
 
@@ -285,6 +333,7 @@ public final class SmsBridge {
                 count++;
             }
         }
+        requireReadAccess();
         emit(metadata().put("count", count).put("types", types));
     }
 
@@ -424,24 +473,23 @@ public final class SmsBridge {
         } catch (Throwable unsupported) {
             subscriptions.put("active_ids_unavailable", unsupported.getClass().getSimpleName());
         }
+        requireReadAccess();
         emit(metadata().put("diagnostics", diagnostics).put("subscriptions", subscriptions)
             .put("read_only", true));
     }
 
     private long countMatching(Uri uri, String where, ArrayList<String> values) throws Exception {
-        stage = "diagnostic_query";
-        try (Cursor cursor = resolver.query(uri, new String[] {"_id"}, where,
+        try (Cursor cursor = queryWithAccessCheck(uri, new String[] {"_id"}, where,
                 values.toArray(new String[0]), null)) {
-            if (cursor == null) throw new BridgeException("null_cursor", "SMS provider returned no diagnostic result.");
-            return cursor.getCount();
+            long count = cursor.getCount();
+            requireReadAccess();
+            return count;
         }
     }
 
     private void delete(File planFile, File cancelFile) throws Exception {
+        requireDeleteAccess();
         LinkedHashMap<Long, String> plan = loadPlan(planFile);
-        if (writeMode != AppOpsManager.MODE_ALLOWED) {
-            throw new BridgeException("write_not_allowed", "Android SMS write access is not allowed for this helper.");
-        }
         long deleted = 0, changed = 0, missing = 0, failed = 0, processed = 0;
         long lastProgress = System.nanoTime();
         boolean cancelled = false;
@@ -453,6 +501,7 @@ public final class SmsBridge {
             try (Cursor cursor = query(uri, FINGERPRINT_FIELDS)) {
                 if (cursor.moveToFirst()) row = record(cursor);
             }
+            requireReadAccess();
             if (row == null) {
                 missing++;
             } else if (!item.getValue().equals(fingerprint(row))) {
@@ -464,6 +513,7 @@ public final class SmsBridge {
                 // ignores selection on this URI, so do not pretend a SQL predicate
                 // makes this atomic: a message can change between the fingerprint
                 // query and delete. Scope remains exactly the planned numeric ID.
+                requireDeleteAccess();
                 stage = "delete";
                 int affected = resolver.delete(uri, null, null);
                 if (affected == 1) deleted++;
@@ -495,6 +545,7 @@ public final class SmsBridge {
                 }
             }
         }
+        requireReadAccess();
         emit(progress("summary", plan.size(), processed, deleted, changed, missing, failed)
             .put("remaining_target", remainingTarget).put("remaining_total", remainingTotal)
             .put("cancelled", cancelled).put("verified", true));

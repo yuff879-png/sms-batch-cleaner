@@ -107,6 +107,31 @@ class UpdateUiTests(unittest.TestCase):
         self.assertIsNone(self.ui.plan_result)
         self.assertEqual(str(self.ui.delete_button["state"]), "disabled")
 
+    def test_zero_sms_keeps_scope_clear_and_logs_only_device_suffix(self):
+        self.snapshot.count = 0
+        self.snapshot.types = {}
+        self.ui._plan_ready(self.snapshot)
+        self.drain()
+        self.assertIn("本机 SMS", self.ui.status.get())
+        self.assertIn("重新打开", self.ui.plan_info.get())
+        self.assertNotIn("当前手机没有短信", self.ui.plan_info.get())
+        self.assertEqual(str(self.ui.delete_button["state"]), "disabled")
+        logs = "\n".join(self.ui.log_lines)
+        self.assertIn("尾号 1234", logs)
+        self.assertNotIn(self.snapshot.serial, logs)
+        self.assertIn("MMS、RCS", logs)
+
+    def test_verified_zero_result_explains_sms_scope_and_refresh(self):
+        with patch.object(app.messagebox, "showinfo") as popup:
+            self.ui._delete_ready({"deleted": 2, "missing": 0, "changed": 0,
+                                   "failed": 0, "remaining_target": 0,
+                                   "remaining_total": 0, "verified": True,
+                                   "cancelled": False})
+        prompt = popup.call_args.args[1]
+        self.assertIn("当前本机 SMS 总数：0", prompt)
+        self.assertIn("重新打开", prompt)
+        self.assertIn("RCS", prompt)
+
     def test_phone_operation_blocks_check_download_and_update_controls(self):
         self.ui.operation = "清空短信"
         self.ui.operation_domain = "phone"

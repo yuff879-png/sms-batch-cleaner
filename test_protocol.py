@@ -86,7 +86,8 @@ class BridgeProtocolTests(unittest.TestCase):
                 if call.args and call.args[0][0] == "shell" and call.args[0][1].startswith("rm -f ")]
 
     def test_valid_summary_and_zero_exit_are_required_for_success(self):
-        summary = {"event": "summary", "count": 0, "types": {}, "uid": 1001, "write_sms_mode": 0}
+        summary = {"event": "summary", "count": 0, "types": {}, "uid": 1001,
+                   "read_sms_mode": 0, "write_sms_mode": 0}
         self.phone_output(summary)
         self.assertEqual(self.cleaner._run_bridge(self.serial, "probe"), summary)
         self.phone_output(summary, exit_code=1)
@@ -117,6 +118,38 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertIn("permission", message)
         self.assertNotIn(secret, message + json.dumps(self.logs + self.progress))
 
+    def test_read_not_allowed_is_actionable_unknown_and_logs_integer_modes_only(self):
+        secret = "PRIVATE_PHONE_BODY_AND_SERIAL"
+        self.cleaner._probed.add(self.serial)
+        self.phone_output({"event": "error", "code": "read_not_allowed",
+                           "read_sms_mode": 1, "write_sms_mode": 0, "count": 0,
+                           "message": secret, "exception_class": secret, "serial": self.serial,
+                           "body": secret, "stage": secret, "hint": secret}, exit_code=1)
+        with self.assertRaises(CleanerError) as caught:
+            self.cleaner._run_bridge(self.serial, "probe")
+        combined = str(caught.exception) + "\n".join(self.logs)
+        self.assertIn("读取受限", combined)
+        self.assertIn("数量未知", combined)
+        self.assertIn("read_sms_mode=1, write_sms_mode=0", combined)
+        self.assertNotIn("0 条", combined)
+        self.assertNotIn(secret, combined)
+        self.assertNotIn(self.serial, combined)
+        self.assertNotIn(self.serial, self.cleaner._probed)
+
+    def test_read_error_missing_or_noninteger_modes_are_unknown_without_echo(self):
+        cases = ({}, {"read_sms_mode": "PRIVATE_READ_MODE", "write_sms_mode": {"body": "PRIVATE_BODY"}},
+                 {"read_sms_mode": False, "write_sms_mode": 0.0})
+        for modes in cases:
+            with self.subTest(modes=modes):
+                self.logs.clear()
+                self.phone_output({"event": "error", "code": "read_not_allowed", **modes}, exit_code=1)
+                with self.assertRaises(CleanerError) as caught:
+                    self.cleaner._run_bridge(self.serial, "probe")
+                combined = str(caught.exception) + "\n".join(self.logs)
+                self.assertIn("read_sms_mode=unknown, write_sms_mode=unknown", combined)
+                self.assertNotIn("PRIVATE_", combined)
+                self.assertIn("数量未知", combined)
+
     def test_status_events_reach_progress_for_scanning_and_verification(self):
         status = {"event": "status", "phase": "verifying", "processed": 230}
         self.phone_output(status, {"event": "summary", "count": 230, "types": {"1": 230}})
@@ -135,7 +168,7 @@ class BridgeProtocolTests(unittest.TestCase):
         private = "PRIVATE_BODY_MUST_NOT_BE_SAVED"
         self.phone_output("ART diagnostic " + private,
                           {"event": "target", "id": "5", "fingerprint": "a" * 64})
-        safe_info = {"uid": 1001, "write_sms_mode": 0, "model": "Mock phone",
+        safe_info = {"uid": 1001, "read_sms_mode": 0, "write_sms_mode": 0, "model": "Mock phone",
                      "android": "15", "count": 1, "types": {"1": 1}}
         with patch.object(self.cleaner, "probe", return_value=safe_info):
             with self.assertRaises(CleanerError):
