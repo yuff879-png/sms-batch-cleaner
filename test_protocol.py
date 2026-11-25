@@ -150,6 +150,156 @@ class BridgeProtocolTests(unittest.TestCase):
                 self.assertNotIn("PRIVATE_", combined)
                 self.assertIn("数量未知", combined)
 
+    def test_device_busy_known_holder_has_actionable_message_and_safe_lock_log(self):
+        self.cleaner._probed.add(self.serial)
+        self.phone_output({"event": "error", "code": "device_busy", "stage": "operation_lock",
+                           "lock_state": "holder_observed", "lock_holder_pid": 4321}, exit_code=1)
+        with self.assertRaises(CleanerError) as caught:
+            self.cleaner._run_bridge(self.serial, "probe")
+        message = str(caught.exception)
+        self.assertIn("手机端观察到操作锁持有记录，可能有其他清理任务尚未结束", message)
+        self.assertNotIn("检测到其他进程持有操作锁", message)
+        self.assertIn("本次操作尚未读取或删除短信", message)
+        self.assertIn("其他任务的状态未知", message)
+        self.assertIn("停止并等待确认", message)
+        self.assertIn("只保留一个工具窗口", message)
+        self.assertIn("重启手机后重新检测", message)
+        self.assertIn("重启后仍报错，请复制日志", message)
+        self.assertEqual(self.logs, ["手机操作锁诊断：stage=operation_lock code=device_busy "
+                                     "action=probe lock_state=holder_observed lock_holder_pid=4321"])
+        self.assertNotIn("root", message)
+        self.assertNotIn(self.serial, self.cleaner._probed)
+
+    def test_device_busy_unobserved_or_unknown_holder_does_not_claim_absence(self):
+        for state in ("no_holder_observed", "unknown"):
+            with self.subTest(state=state):
+                self.logs.clear()
+                self.phone_output({"event": "error", "code": "device_busy", "stage": "operation_lock",
+                                   "lock_state": state}, exit_code=1)
+                with self.assertRaises(CleanerError) as caught:
+                    self.cleaner._run_bridge(self.serial, "scan")
+                combined = str(caught.exception) + "\n".join(self.logs)
+                self.assertIn("原因尚未确认", combined)
+                self.assertIn("可能涉及旧任务、并发窗口或系统锁限制", combined)
+                self.assertNotIn("观察到操作锁持有记录", combined)
+                self.assertNotIn("没有旧进程", combined)
+                self.assertNotIn("MIUI", combined)
+                self.assertNotIn("root", combined)
+                self.assertNotIn("read_sms_mode", combined)
+                self.assertNotIn("write_sms_mode", combined)
+                self.assertIn(f"action=scan lock_state={state}", combined)
+
+    def test_device_busy_legacy_error_without_lock_fields_fails_closed(self):
+        self.phone_output({"event": "error", "code": "device_busy"}, exit_code=1)
+        with self.assertRaises(CleanerError) as caught:
+            self.cleaner._run_bridge(self.serial, "probe")
+        self.assertIn("本次操作尚未读取或删除短信", str(caught.exception))
+        self.assertIn("lock_state=unknown", self.logs[0])
+        self.assertNotIn("lock_holder_pid", self.logs[0])
+        self.assertNotIn("read_sms_mode", "\n".join(self.logs))
+
+    def test_operation_lock_stage_uses_lock_diagnostic_without_raw_error_details(self):
+        secret = "PRIVATE_SERIAL_AND_SMS_BODY"
+        self.phone_output({"event": "error", "code": secret, "stage": "operation_lock",
+                           "lock_state": {"body": secret}, "lock_holder_pid": secret,
+                           "exception_class": secret, "message": secret, "hint": secret,
+                           "classification": {secret: True}, "read_sms_mode": secret,
+                           "write_sms_mode": secret, "action": secret}, exit_code=1)
+        with self.assertRaises(CleanerError) as caught:
+            self.cleaner._run_bridge(self.serial, secret)
+        combined = str(caught.exception) + "\n".join(self.logs)
+        self.assertNotIn(secret, combined)
+        self.assertEqual(self.logs, ["手机操作锁诊断：stage=operation_lock code=unknown_lock_error "
+                                     "action=unknown lock_state=unknown"])
+        self.assertNotIn("read_sms_mode", combined)
+        self.assertNotIn("write_sms_mode", combined)
+
+    def test_device_busy_pid_requires_positive_bounded_int_not_bool_or_string(self):
+        for pid in (False, True, 0, -1, 1.0, "4321", [], {}, None, 2147483648):
+            with self.subTest(pid=pid):
+                self.logs.clear()
+                self.phone_output({"event": "error", "code": "device_busy", "stage": "operation_lock",
+                                   "lock_state": "holder_observed", "lock_holder_pid": pid}, exit_code=1)
+                with self.assertRaises(CleanerError):
+                    self.cleaner._run_bridge(self.serial, "probe")
+                self.assertNotIn("lock_holder_pid", "\n".join(self.logs))
+
+    def test_lock_error_preserves_only_allowlisted_error_codes(self):
+        for code in ("device_busy", "unsafe_lock_path", "android_permission_denied", "android_error"):
+            with self.subTest(code=code):
+                self.logs.clear()
+                self.phone_output({"event": "error", "code": code, "stage": "operation_lock"}, exit_code=1)
+                with self.assertRaises(CleanerError) as caught:
+                    self.cleaner._run_bridge(self.serial, "probe")
+                self.assertIn(f"code={code}", str(caught.exception))
+                self.assertEqual(self.logs, [f"手机操作锁诊断：stage=operation_lock code={code} "
+                                             "action=probe lock_state=unknown"])
+
+    def test_lock_error_does_not_sanitize_untrusted_code_into_loggable_data(self):
+        for code in ("device_busy\nPRIVATE", "PRIVATE_SERIAL_1234", None, {}, [], True):
+            with self.subTest(code=code):
+                self.logs.clear()
+                self.phone_output({"event": "error", "code": code, "stage": "operation_lock"}, exit_code=1)
+                with self.assertRaises(CleanerError) as caught:
+                    self.cleaner._run_bridge(self.serial, "probe")
+                combined = str(caught.exception) + "\n".join(self.logs)
+                self.assertIn("code=unknown_lock_error", combined)
+                self.assertNotIn("PRIVATE", combined)
+
+    def test_lock_pid_is_omitted_without_observed_holder(self):
+        for state in ("no_holder_observed", "unknown", None, "PRIVATE_STATE"):
+            with self.subTest(state=state):
+                self.logs.clear()
+                self.phone_output({"event": "error", "code": "device_busy", "stage": "operation_lock",
+                                   "lock_state": state, "lock_holder_pid": 4321}, exit_code=1)
+                with self.assertRaises(CleanerError):
+                    self.cleaner._run_bridge(self.serial, "probe")
+                self.assertNotIn("lock_holder_pid", "\n".join(self.logs))
+
+    def test_lock_diagnostic_accepts_bounded_integer_sdk_and_32_or_64_bits(self):
+        for sdk, bits in ((1, 32), (29, 32), (35, 64), (10000, 64)):
+            with self.subTest(sdk=sdk, bits=bits):
+                self.logs.clear()
+                self.phone_output({"event": "error", "code": "device_busy", "stage": "operation_lock",
+                                   "lock_state": "unknown", "sdk": sdk, "process_bits": bits}, exit_code=1)
+                with self.assertRaises(CleanerError):
+                    self.cleaner._run_bridge(self.serial, "scan")
+                self.assertEqual(self.logs, ["手机操作锁诊断：stage=operation_lock code=device_busy "
+                                             f"action=scan lock_state=unknown sdk={sdk} process_bits={bits}"])
+
+    def test_lock_diagnostic_rejects_bool_string_or_invalid_sdk_and_bits(self):
+        invalid = (None, True, False, 0, -1, 10001, "32", 32.0, {}, [], "PRIVATE_PHONE_BODY")
+        for value in invalid:
+            with self.subTest(value=value):
+                self.logs.clear()
+                self.phone_output({"event": "error", "code": "device_busy", "stage": "operation_lock",
+                                   "sdk": value, "process_bits": value}, exit_code=1)
+                with self.assertRaises(CleanerError) as caught:
+                    self.cleaner._run_bridge(self.serial, "probe")
+                combined = str(caught.exception) + "\n".join(self.logs)
+                self.assertNotIn("sdk=", combined)
+                self.assertNotIn("process_bits=", combined)
+                self.assertNotIn("PRIVATE_PHONE_BODY", combined)
+
+    def test_device_busy_delete_keeps_host_lock_without_retry_or_remote_unlock(self):
+        self.phone_output({"event": "error", "code": "device_busy", "stage": "operation_lock",
+                           "lock_state": "holder_observed", "lock_holder_pid": 4321}, exit_code=1)
+        with self.assertRaises(CleanerError) as caught:
+            self.run_delete()
+        self.assertIn("本次操作尚未读取或删除短信", str(caught.exception))
+        marker = self.cleaner._state_path(self.serial)
+        self.assertTrue(marker.is_file())
+        self.assertEqual(json.loads(marker.read_text(encoding="utf-8")),
+                         {"boot_id": self.boot_id, "state": "awaiting_confirmation"})
+        self.assertFalse(self.cleanup_commands())
+        self.popen.assert_called_once()
+        self.assertIn("action=delete", self.logs[0])
+        for call in self.command.call_args_list:
+            command = " ".join(call.args[0])
+            self.assertNotIn("kill", command)
+            self.assertNotIn("unlink", command)
+            self.assertNotIn("rm -f", command)
+
     def test_status_events_reach_progress_for_scanning_and_verification(self):
         status = {"event": "status", "phase": "verifying", "processed": 230}
         self.phone_output(status, {"event": "summary", "count": 230, "types": {"1": 230}})

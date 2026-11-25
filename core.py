@@ -85,6 +85,35 @@ class Cleaner:
         return ", ".join(f"{key}={result[key] if type(result.get(key)) is int else 'unknown'}"
                          for key in ("read_sms_mode", "write_sms_mode"))
 
+    def _operation_lock_error(self, event, action):
+        state = event.get("lock_state")
+        if state not in ("holder_observed", "no_holder_observed", "unknown"):
+            state = "unknown"
+        code = event.get("code")
+        if code not in ("device_busy", "unsafe_lock_path", "android_permission_denied", "android_error"):
+            code = "unknown_lock_error"
+        safe_action = action if action in ("probe", "scan", "delete") else "unknown"
+        diagnostic = f"stage=operation_lock code={code} action={safe_action} lock_state={state}"
+        holder_pid = event.get("lock_holder_pid")
+        if state == "holder_observed" and type(holder_pid) is int and 0 < holder_pid <= 2147483647:
+            diagnostic += f" lock_holder_pid={holder_pid}"
+        sdk = event.get("sdk")
+        if type(sdk) is int and 0 < sdk <= 10000:
+            diagnostic += f" sdk={sdk}"
+        process_bits = event.get("process_bits")
+        if type(process_bits) is int and process_bits in (32, 64):
+            diagnostic += f" process_bits={process_bits}"
+        self.log("手机操作锁诊断：" + diagnostic)
+        if state == "holder_observed":
+            reason = "手机端观察到操作锁持有记录，可能有其他清理任务尚未结束。"
+        else:
+            reason = "手机端无法取得操作锁，原因尚未确认，可能涉及旧任务、并发窗口或系统锁限制。"
+        return CleanerError(
+            reason + "本次操作尚未读取或删除短信；其他任务的状态未知。"
+            "如有正在运行的任务，请先在对应窗口停止并等待确认，再只保留一个工具窗口。"
+            "确认没有运行任务仍失败时，请重启手机后重新检测；重启后仍报错，请复制日志给维护人员。"
+            f"（code={code}，stage=operation_lock）")
+
     @staticmethod
     def _device_diagnostic(result, serial):
         model = result.get("model")
@@ -322,6 +351,9 @@ class Cleaner:
                     continue
                 kind = event.get("event")
                 if kind == "error":
+                    if event.get("code") == "device_busy" or event.get("stage") == "operation_lock":
+                        self._probed.discard(serial)
+                        raise self._operation_lock_error(event, action)
                     self.log("短信接口权限诊断：" + self._sms_modes(event))
                     if event.get("code") == "read_not_allowed":
                         self._probed.discard(serial)

@@ -17,3 +17,16 @@
 `publish_release.py` 通过本机 Git Credential Manager 获取当前操作者授权，不将令牌写入文件或传给最终使用者。上传失败时 Release 保留为草稿，请处理该草稿后重试，避免重复版本。
 
 初始 v1.0.0 没有在线更新入口，需手动解压 v1.1.0 一次；之后可在界面检查并安装更新。系统策略阻止的文件不会通过关闭安全设置处理。
+
+## Android 锁诊断测试
+
+修改锁诊断解析后，先按上述步骤构建桥接器，再运行实际嵌套解析器的 JVM 测试。测试输出独立存放，不能放进 `android/build/classes` 或发行桥接包。
+
+```powershell
+& 'C:\Program Files\Java\jdk-21.0.10\bin\javac.exe' -encoding UTF-8 --release 8 -classpath android\build\classes -d android\build\testclasses android\tests\LockObservationTest.java
+if ($LASTEXITCODE -ne 0) { throw 'JVM test compilation failed' }
+& 'C:\Program Files\Java\jdk-21.0.10\bin\java.exe' -cp 'android\build\classes;android\build\testclasses' LockObservationTest
+if ($LASTEXITCODE -ne 0) { throw 'JVM tests failed' }
+```
+
+这些测试不依赖手机，覆盖设备号及 inode 匹配、锁类型、等待者、读取失败和读取大小限制；不能代替现场 ROM 验证。

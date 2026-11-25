@@ -27,6 +27,8 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.FileDescriptor;
 import java.io.InputStreamReader;
+import java.io.InputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.PrintWriter;
 import java.io.OutputStreamWriter;
 import java.lang.reflect.Method;
@@ -60,6 +62,7 @@ public final class SmsBridge {
     private static FileOutputStream lockStream;
     private static FileChannel lockChannel;
     private static FileLock operationLock;
+    private static LockObservation lockObservation;
     private ContentResolver resolver;
     private Context context;
     private AppOpsManager appOps;
@@ -111,6 +114,15 @@ public final class SmsBridge {
                 // Omit modes not yet observed; default 0 would falsely mean allowed.
                 if (bridge.readMode != null) error.put("read_sms_mode", bridge.readMode.intValue());
                 if (bridge.writeMode != null) error.put("write_sms_mode", bridge.writeMode.intValue());
+                if ("operation_lock".equals(stage)) {
+                    error.put("sdk", Build.VERSION.SDK_INT).put("process_bits", Process.is64Bit() ? 64 : 32);
+                    if (lockObservation != null) {
+                        error.put("lock_state", lockObservation.state);
+                        if (lockObservation.holderPid != null) {
+                            error.put("lock_holder_pid", lockObservation.holderPid.intValue());
+                        }
+                    }
+                }
                 emit(error);
             } catch (Throwable ignored) { }
             System.exit(1);
@@ -224,7 +236,113 @@ public final class SmsBridge {
         try { operationLock = lockChannel.tryLock(); }
         catch (OverlappingFileLockException busy) { operationLock = null; }
         if (operationLock == null) {
-            throw new BridgeException("device_busy", "Another SMS cleaner operation is already running on this device.");
+            // Only inspect proc on failure. Reuse the existing descriptor's stat;
+            // opening/closing another descriptor for this inode could release a
+            // POSIX lock owned by this process. Never change or unlink the lock.
+            lockObservation = observeOperationLock(file);
+            throw new BridgeException("device_busy", "The device operation lock could not be acquired.");
+        }
+    }
+
+    private static LockObservation observeOperationLock(StructStat file) {
+        try (InputStream source = new FileInputStream("/proc/locks")) {
+            return LockObservation.parse(source, file.st_dev, file.st_ino);
+        } catch (Exception unavailable) {
+            return LockObservation.unknown();
+        }
+    }
+
+    /** Bounded, pure-Java parser so lock observations can be tested on the host. */
+    static final class LockObservation {
+        static final int MAX_BYTES = 64 * 1024;
+        static final int MAX_LINES = 1024;
+        final String state;
+        final Integer holderPid;
+
+        LockObservation(String state, Integer holderPid) {
+            this.state = state;
+            this.holderPid = holderPid;
+        }
+
+        static LockObservation unknown() { return new LockObservation("unknown", null); }
+
+        static LockObservation parse(InputStream source, long device, long inode) {
+            try {
+                ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+                byte[] buffer = new byte[4096];
+                int total = 0;
+                int read;
+                while ((read = source.read(buffer, 0, Math.min(buffer.length, MAX_BYTES + 1 - total))) != -1) {
+                    if (read == 0) return unknown();
+                    total += read;
+                    if (total > MAX_BYTES) return unknown();
+                    bytes.write(buffer, 0, read);
+                }
+                byte[] raw = bytes.toByteArray();
+                for (byte value : raw) {
+                    int character = value & 255;
+                    if ((character < 32 && character != 9 && character != 10 && character != 13)
+                            || character > 126) return unknown();
+                }
+                // Android bionic sys/sysmacros.h major()/minor(), including
+                // high bits of a 64-bit dev_t. Proc renders both parts in hex.
+                long major = ((device >>> 32) & 0xfffff000L) | ((device >>> 8) & 0xfffL);
+                long minor = ((device >>> 12) & 0xffffff00L) | (device & 0xffL);
+                String text = new String(raw, StandardCharsets.US_ASCII);
+                String[] lines = text.split("\n", -1);
+                int count = lines.length;
+                if (count > 0 && lines[count - 1].isEmpty()) count--;
+                if (count > MAX_LINES) return unknown();
+                boolean observed = false;
+                Integer pid = null;
+                for (int index = 0; index < count; index++) {
+                    String[] fields = lines[index].trim().split("\\s+");
+                    if (fields.length < 2 || !fields[0].matches("[0-9]+:")) return unknown();
+                    boolean waiting = "->".equals(fields[1]);
+                    int offset = waiting ? 1 : 0;
+                    if (fields.length != 8 + offset) return unknown();
+                    String kind = fields[1 + offset];
+                    String status = fields[2 + offset];
+                    if (!("POSIX".equals(kind) || "FLOCK".equals(kind) || "OFDLCK".equals(kind)
+                            || "LEASE".equals(kind))) return unknown();
+                    if (!("ADVISORY".equals(status) || "MANDATORY".equals(status)
+                            || "ACTIVE".equals(status) || "BREAKING".equals(status))) return unknown();
+                    if (!("READ".equals(fields[3 + offset]) || "WRITE".equals(fields[3 + offset])
+                            || "UNLCK".equals(fields[3 + offset]))) return unknown();
+                    String process = fields[4 + offset];
+                    if (!process.matches("-1|[0-9]+")) return unknown();
+                    long processId = Long.parseLong(process);
+                    if (processId > Integer.MAX_VALUE) return unknown();
+                    String[] identity = fields[5 + offset].split(":", -1);
+                    if (identity.length != 3 || !identity[0].matches("[0-9a-fA-F]{1,8}")
+                            || !identity[1].matches("[0-9a-fA-F]{1,8}")
+                            || !identity[2].matches("[0-9]{1,20}")) return unknown();
+                    long entryMajor = Long.parseLong(identity[0], 16);
+                    long entryMinor = Long.parseLong(identity[1], 16);
+                    long entryInode = Long.parseUnsignedLong(identity[2]);
+                    if (!fields[6 + offset].matches("[0-9]+")) return unknown();
+                    long start = Long.parseLong(fields[6 + offset]);
+                    String endText = fields[7 + offset];
+                    if (!"EOF".equals(endText)) {
+                        if (!endText.matches("[0-9]+") || Long.parseLong(endText) < start) return unknown();
+                    }
+                    // FileChannel uses POSIX record locks. FLOCK and LEASE
+                    // records on the same inode are not conflicting record
+                    // locks, so parse their known format but do not count them.
+                    if (!waiting && ("POSIX".equals(kind) || "OFDLCK".equals(kind))
+                            && !"UNLCK".equals(fields[3 + offset])
+                            && entryMajor == major && entryMinor == minor && entryInode == inode) {
+                        observed = true;
+                        if (pid == null && processId > 0) pid = Integer.valueOf((int) processId);
+                    }
+                }
+                // Proc visibility is namespace- and permission-dependent. An
+                // unmatched complete snapshot is an observation, not proof that
+                // the lock is free or that access denial caused tryLock failure.
+                return new LockObservation(observed ? "holder_observed" : "no_holder_observed", pid);
+            } catch (Exception invalidOrUnavailable) {
+                return unknown();
+            }
         }
     }
 
